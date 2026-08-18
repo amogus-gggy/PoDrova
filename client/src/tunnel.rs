@@ -1,79 +1,41 @@
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
+use std::net::{Ipv4Addr, TcpStream};
 use std::thread;
 
-use common::protocol::{Address, Message};
-
-use crate::socks5::{self, CMD_CONNECT, REP_COMMAND_NOT_SUPPORTED, REP_GENERAL_FAILURE, REP_SUCCEEDED};
+use common::protocol;
+use tun::{Configuration, Device};
 
 #[derive(Debug, Clone)]
-pub struct VpnServerConfig {
-    pub address: String,
-    pub port: u16,
+pub struct ClientConfig {
+    pub server_addr: String,
+    pub server_port: u16,
+    pub local_ip: Ipv4Addr,
+    pub gateway: Ipv4Addr,
+    pub netmask: Ipv4Addr,
+    pub mtu: u16,
 }
 
-pub fn handle_connection(stream: TcpStream, config: VpnServerConfig) -> io::Result<()> {
-    let mut local = stream;
-    local.set_nodelay(true)?;
+pub fn run_client(config: ClientConfig) -> io::Result<()> {
+    let dev = create_tun(&config)?;
+    println!(
+        "TUN device up: {} mask {} gateway {} mtu {}",
+        config.local_ip, config.netmask, config.gateway, config.mtu
+    );
 
-    socks5::read_greeting(&mut local)?;
-    socks5::write_method_selection(&mut local)?;
+    let mut conn = TcpStream::connect((config.server_addr.as_str(), config.server_port))?;
+    conn.set_nodelay(true)?;
+    protocol::write_register(&mut conn, config.local_ip)?;
+    println!(
+        "connected to tunnel server {}:{} (pumping packets)",
+        config.server_addr, config.server_port
+    );
 
-    let request = socks5::read_connect_request(&mut local)?;
+    let (tun_reader, tun_writer) = dev.split();
+    let conn_reader = conn.try_clone()?;
+    let conn_writer = conn.try_clone()?;
 
-    if request.cmd != CMD_CONNECT {
-        let _ = socks5::write_reply(
-            &mut local,
-            REP_COMMAND_NOT_SUPPORTED,
-            socks5::hint_bind(&request.addr),
-        );
-        return Ok(());
-    }
-
-    let dest = request.addr;
-    let id = session_id();
-    let bind = socks5::hint_bind(&dest);
-
-    match establish(&mut local, dest, id, &config) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = socks5::write_reply(&mut local, REP_GENERAL_FAILURE, bind);
-            Err(e)
-        }
-    }
-}
-
-fn establish(
-    local: &mut TcpStream,
-    dest: Address,
-    id: u16,
-    config: &VpnServerConfig,
-) -> io::Result<()> {
-    let mut vpn = TcpStream::connect((config.address.as_str(), config.port))?;
-    vpn.set_nodelay(true)?;
-
-    Message::connect(id, dest.clone()).write(&mut vpn)?;
-
-    match Message::read(&mut vpn)? {
-        Message::Connected { .. } => {
-            socks5::write_reply(local, REP_SUCCEEDED, socks5::hint_bind(&dest))?;
-            tunnel(local, vpn, id)
-        }
-        Message::Error { .. } => {
-            socks5::write_reply(local, REP_GENERAL_FAILURE, socks5::hint_bind(&dest))?;
-            Ok(())
-        }
-        _ => Err(io::Error::other("unexpected reply from vpn server")),
-    }
-}
-
-fn tunnel(local: &mut TcpStream, vpn: TcpStream, id: u16) -> io::Result<()> {
-    let local_reader = local.try_clone()?;
-    let local_writer = local.try_clone()?;
-    let vpn_writer = vpn.try_clone()?;
-
-    let up = thread::spawn(move || pump_up(local_reader, vpn_writer, id));
-    let down = thread::spawn(move || pump_down(vpn, local_writer));
+    let up = thread::spawn(move || pump_to_server(tun_reader, conn_writer));
+    let down = thread::spawn(move || pump_from_server(conn_reader, tun_writer));
 
     let up_res = up
         .join()
@@ -82,40 +44,72 @@ fn tunnel(local: &mut TcpStream, vpn: TcpStream, id: u16) -> io::Result<()> {
         .join()
         .unwrap_or_else(|_| Err(io::Error::other("downstream pump panicked")));
 
-    // A normal tunnel shutdown may have either side closed first; ignore EOF
-    // and propagate real errors only.
+    // A tunnel normally tears down from either side first; treat a closed
+    // direction as a clean shutdown and surface only real errors.
     if up_res.is_err() || down_res.is_err() {
         return Ok(());
     }
     Ok(())
 }
 
-fn pump_up(mut src: TcpStream, mut dst: TcpStream, id: u16) -> io::Result<()> {
-    let mut buf = [0u8; common::protocol::MAX_PAYLOAD];
+fn create_tun(config: &ClientConfig) -> io::Result<Device> {
+    let mut c = Configuration::default();
+    c.address(config.local_ip)
+        .netmask(config.netmask)
+        .mtu(config.mtu)
+        .up();
+
+    #[cfg(target_os = "windows")]
+    {
+        c.destination(config.gateway);
+        c.metric(1);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        c.tun_name("tun0");
+        c.destination(config.gateway);
+    }
+
+    let dev = tun::create(&c).map_err(|e| io::Error::other(e.to_string()))?;
+
+    #[cfg(target_os = "linux")]
+    configure_linux_routes(config, &dev)?;
+
+    Ok(dev)
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_routes(config: &ClientConfig, _dev: &Device) -> io::Result<()> {
+    use std::process::Command;
+    Command::new("ip")
+        .args(["route", "add", "default", "via", &config.gateway.to_string(), "dev", "tun0"])
+        .status()?;
+    Ok(())
+}
+
+fn pump_to_server<R: Read>(mut tun: R, mut conn: TcpStream) -> io::Result<()> {
+    let mut buf = vec![0u8; protocol::MAX_PACKET];
     loop {
-        let n = src.read(&mut buf)?;
+        let n = tun.read(&mut buf)?;
         if n == 0 {
             break;
         }
-        Message::data(id, buf[..n].to_vec()).write(&mut dst)?;
+        protocol::write_packet(&mut conn, &buf[..n])?;
     }
     Ok(())
 }
 
-fn pump_down(mut src: TcpStream, mut dst: TcpStream) -> io::Result<()> {
+fn pump_from_server<W: Write>(mut conn: TcpStream, mut tun: W) -> io::Result<()> {
     loop {
-        match Message::read(&mut src) {
-            Ok(Message::Data { payload, .. }) => dst.write_all(&payload)?,
-            Ok(_) => continue,
+        let packet = match protocol::read_packet(&mut conn) {
+            Ok(p) => p,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
+        };
+        if !packet.is_empty() {
+            tun.write_all(&packet)?;
         }
     }
     Ok(())
-}
-
-fn session_id() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
 }

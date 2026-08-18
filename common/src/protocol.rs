@@ -20,6 +20,13 @@ pub const ATYP_IPV6: u8 = 0x04;
 pub const MAX_PAYLOAD: usize = 64 * 1024;
 const FRAME_HEADER: usize = 5;
 
+// Network-layer tunnel framing over the transport connection.
+// A registration frame fixes the client's virtual IP, then both sides
+// exchange raw IP packets as [u32 length BE][payload].
+pub const TYPE_REGISTER: u8 = 0x01;
+
+pub const MAX_PACKET: usize = u16::MAX as usize;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Address {
     Ipv4(Ipv4Addr, u16),
@@ -211,6 +218,57 @@ impl Message {
             )),
         }
     }
+}
+
+/// Serialize a raw IP packet as [u32 length BE][payload].
+pub fn write_packet(writer: &mut impl Write, packet: &[u8]) -> io::Result<()> {
+    if packet.len() > MAX_PACKET {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("packet too large: {}", packet.len()),
+        ));
+    }
+    writer.write_all(&(packet.len() as u32).to_be_bytes())?;
+    writer.write_all(packet)?;
+    writer.flush()
+}
+
+/// Read one length-prefixed raw IP packet.
+pub fn read_packet(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > MAX_PACKET {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("packet too large: {len}"),
+        ));
+    }
+    let mut packet = vec![0u8; len];
+    reader.read_exact(&mut packet)?;
+    Ok(packet)
+}
+
+/// Client-side handshake: tell the server which virtual IP this tunnel owns.
+pub fn write_register(writer: &mut impl Write, ip: Ipv4Addr) -> io::Result<()> {
+    writer.write_all(&[TYPE_REGISTER])?;
+    writer.write_all(&ip.octets())?;
+    writer.flush()
+}
+
+/// Server-side handshake: learn the virtual IP of an incoming tunnel.
+pub fn read_register(reader: &mut impl Read) -> io::Result<Ipv4Addr> {
+    let mut tag = [0u8; 1];
+    reader.read_exact(&mut tag)?;
+    if tag[0] != TYPE_REGISTER {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected register frame, got {:#04x}", tag[0]),
+        ));
+    }
+    let mut bytes = [0u8; 4];
+    reader.read_exact(&mut bytes)?;
+    Ok(Ipv4Addr::from(bytes))
 }
 
 fn read_u8(reader: &mut impl Read) -> io::Result<u8> {
