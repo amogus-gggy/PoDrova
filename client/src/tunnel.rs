@@ -8,6 +8,7 @@ use tun::{Configuration, Device};
 use crate::config::ClientConfig;
 
 pub fn run_client(config: ClientConfig) -> io::Result<()> {
+    let crypto = build_crypto(&config)?;
     let dev = create_tun(&config)?;
     println!(
         "TUN device up: {} mask {} gateway {} mtu {}",
@@ -16,8 +17,8 @@ pub fn run_client(config: ClientConfig) -> io::Result<()> {
 
     let mut conn = TcpStream::connect((config.server.addr.as_str(), config.server.port))?;
     conn.set_nodelay(true)?;
-    protocol::write_auth(&mut conn, config.auth.token.as_bytes())?;
-    match protocol::read_auth_result(&mut conn)? {
+    protocol::write_auth(&mut conn, &crypto, config.auth.token.as_bytes())?;
+    match protocol::read_auth_result(&mut conn, &crypto)? {
         true => {}
         false => {
             return Err(io::Error::new(
@@ -26,9 +27,9 @@ pub fn run_client(config: ClientConfig) -> io::Result<()> {
             ));
         }
     }
-    protocol::write_register(&mut conn, config.tun.local_ip)?;
+    protocol::write_register(&mut conn, &crypto, config.tun.local_ip)?;
     println!(
-        "connected to tunnel server {}:{} (pumping packets)",
+        "connected to tunnel server {}:{} (pumping encrypted packets)",
         config.server.addr, config.server.port
     );
 
@@ -36,8 +37,9 @@ pub fn run_client(config: ClientConfig) -> io::Result<()> {
     let conn_reader = conn.try_clone()?;
     let conn_writer = conn.try_clone()?;
 
-    let up = thread::spawn(move || pump_to_server(tun_reader, conn_writer));
-    let down = thread::spawn(move || pump_from_server(conn_reader, tun_writer));
+    let up_crypto = crypto.clone();
+    let up = thread::spawn(move || pump_to_server(tun_reader, conn_writer, up_crypto));
+    let down = thread::spawn(move || pump_from_server(conn_reader, tun_writer, crypto));
 
     let up_res = up
         .join()
@@ -90,21 +92,38 @@ fn configure_linux_routes(config: &ClientConfig, _dev: &Device) -> io::Result<()
     Ok(())
 }
 
-fn pump_to_server<R: Read>(mut tun: R, mut conn: TcpStream) -> io::Result<()> {
+fn build_crypto(config: &ClientConfig) -> io::Result<protocol::Crypto> {
+    if config.crypto.key.is_empty() {
+        return Err(io::Error::other(
+            "crypto.key must be set and match the server's key",
+        ));
+    }
+    Ok(protocol::Crypto::from_shared(config.crypto.key.as_bytes()))
+}
+
+fn pump_to_server<R: Read>(
+    mut tun: R,
+    mut conn: TcpStream,
+    crypto: protocol::Crypto,
+) -> io::Result<()> {
     let mut buf = vec![0u8; protocol::MAX_PACKET];
     loop {
         let n = tun.read(&mut buf)?;
         if n == 0 {
             break;
         }
-        protocol::write_packet(&mut conn, &buf[..n])?;
+        protocol::write_packet(&mut conn, &crypto, &buf[..n])?;
     }
     Ok(())
 }
 
-fn pump_from_server<W: Write>(mut conn: TcpStream, mut tun: W) -> io::Result<()> {
+fn pump_from_server<W: Write>(
+    mut conn: TcpStream,
+    mut tun: W,
+    crypto: protocol::Crypto,
+) -> io::Result<()> {
     loop {
-        let packet = match protocol::read_packet(&mut conn) {
+        let packet = match protocol::read_packet(&mut conn, &crypto) {
             Ok(p) => p,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),

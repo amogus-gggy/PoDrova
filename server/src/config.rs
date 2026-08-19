@@ -16,6 +16,14 @@ pub struct ServerConfig {
     /// Outbound interface for NAT masquerading (Linux only).
     pub nat_iface: Option<String>,
     pub auth: AuthConfig,
+    pub crypto: CryptoConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CryptoConfig {
+    /// Shared secret used to derive the encryption key. Must match the client.
+    pub key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -36,7 +44,14 @@ impl Default for ServerConfig {
             mtu: 1500,
             nat_iface: None,
             auth: AuthConfig::default(),
+            crypto: CryptoConfig::default(),
         }
+    }
+}
+
+impl Default for CryptoConfig {
+    fn default() -> Self {
+        CryptoConfig { key: String::new() }
     }
 }
 

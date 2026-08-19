@@ -1,6 +1,10 @@
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Ipv6Addr, TcpStream, ToSocketAddrs};
 
+use chacha20::cipher::{KeyIvInit, StreamCipher};
+use rand::RngCore;
+use sha2::{Digest, Sha256};
+
 // Frame layout: [u32 length BE][body]
 // body: [u8 type][...]
 //  - Connect:  type=0x01, id(u16), atyp(u8), address
@@ -35,6 +39,84 @@ pub const AUTH_RESULT_DENIED: u8 = 0x00;
 
 pub const MAX_PACKET: usize = u16::MAX as usize;
 pub const MAX_AUTH_TOKEN: usize = 1024;
+
+const NONCE_LEN: usize = 12;
+const KEY_LEN: usize = 32;
+
+/// Authenticated-encryption transport context shared by client and server.
+///
+/// All on-wire frames (handshake and data) are ChaCha20-encrypted with a key
+/// derived from the shared secret in the config (SHA-256). Every frame carries
+/// a fresh random nonce, so the wire looks like random bytes and hides the
+/// protocol framing from passive/DPI filters.
+#[derive(Clone)]
+pub struct Crypto {
+    key: [u8; KEY_LEN],
+}
+
+impl Crypto {
+    pub fn from_shared(secret: &[u8]) -> Crypto {
+        let digest = Sha256::digest(secret);
+        let mut key = [0u8; KEY_LEN];
+        key.copy_from_slice(&digest);
+        Crypto { key }
+    }
+
+    /// Encrypt `plaintext` into [12-byte nonce][ciphertext].
+    pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
+        let mut nonce = [0u8; NONCE_LEN];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let mut buf = plaintext.to_vec();
+        let mut cipher = chacha20::ChaCha20::new((&self.key).into(), (&nonce).into());
+        cipher.apply_keystream(&mut buf);
+        let mut out = Vec::with_capacity(NONCE_LEN + buf.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&buf);
+        out
+    }
+
+    /// Decrypt a [nonce][ciphertext] blob produced by `seal`.
+    pub fn open(&self, data: &[u8]) -> io::Result<Vec<u8>> {
+        if data.len() < NONCE_LEN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ciphertext too short",
+            ));
+        }
+        let (nonce, body) = data.split_at(NONCE_LEN);
+        let nonce_arr: [u8; NONCE_LEN] = nonce
+            .try_into()
+            .expect("nonce length already checked");
+        let mut buf = body.to_vec();
+        let mut cipher = chacha20::ChaCha20::new((&self.key).into(), (&nonce_arr).into());
+        cipher.apply_keystream(&mut buf);
+        Ok(buf)
+    }
+}
+
+/// Write a length-prefixed, encrypted frame: [u32 length BE][seal(body)].
+fn write_frame(writer: &mut impl Write, crypto: &Crypto, body: &[u8]) -> io::Result<()> {
+    let enc = crypto.seal(body);
+    writer.write_all(&(enc.len() as u32).to_be_bytes())?;
+    writer.write_all(&enc)?;
+    writer.flush()
+}
+
+/// Read and decrypt one length-prefixed frame, returning the plaintext body.
+fn read_frame(reader: &mut impl Read, crypto: &Crypto, max: usize) -> io::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    reader.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("frame too large: {len}"),
+        ));
+    }
+    let mut enc = vec![0u8; len];
+    reader.read_exact(&mut enc)?;
+    crypto.open(&enc)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Address {
@@ -229,112 +311,99 @@ impl Message {
     }
 }
 
-/// Serialize a raw IP packet as [u32 length BE][payload].
-pub fn write_packet(writer: &mut impl Write, packet: &[u8]) -> io::Result<()> {
+/// Serialize a raw IP packet as an encrypted frame [u32 length BE][seal(packet)].
+pub fn write_packet(
+    writer: &mut impl Write,
+    crypto: &Crypto,
+    packet: &[u8],
+) -> io::Result<()> {
     if packet.len() > MAX_PACKET {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("packet too large: {}", packet.len()),
         ));
     }
-    writer.write_all(&(packet.len() as u32).to_be_bytes())?;
-    writer.write_all(packet)?;
-    writer.flush()
+    write_frame(writer, crypto, packet)
 }
 
-/// Read one length-prefixed raw IP packet.
-pub fn read_packet(reader: &mut impl Read) -> io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_PACKET {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("packet too large: {len}"),
-        ));
-    }
-    let mut packet = vec![0u8; len];
-    reader.read_exact(&mut packet)?;
-    Ok(packet)
+/// Read one length-prefixed, decrypted raw IP packet.
+pub fn read_packet(reader: &mut impl Read, crypto: &Crypto) -> io::Result<Vec<u8>> {
+    read_frame(reader, crypto, MAX_PACKET + NONCE_LEN)
 }
 
 /// Client-side handshake: tell the server which virtual IP this tunnel owns.
-pub fn write_register(writer: &mut impl Write, ip: Ipv4Addr) -> io::Result<()> {
-    writer.write_all(&[TYPE_REGISTER])?;
-    writer.write_all(&ip.octets())?;
-    writer.flush()
+pub fn write_register(writer: &mut impl Write, crypto: &Crypto, ip: Ipv4Addr) -> io::Result<()> {
+    let mut body = Vec::with_capacity(5);
+    body.push(TYPE_REGISTER);
+    body.extend_from_slice(&ip.octets());
+    write_frame(writer, crypto, &body)
 }
 
 /// Server-side handshake: learn the virtual IP of an incoming tunnel.
-pub fn read_register(reader: &mut impl Read) -> io::Result<Ipv4Addr> {
-    let mut tag = [0u8; 1];
-    reader.read_exact(&mut tag)?;
-    if tag[0] != TYPE_REGISTER {
+pub fn read_register(reader: &mut impl Read, crypto: &Crypto) -> io::Result<Ipv4Addr> {
+    let body = read_frame(reader, crypto, 5 + NONCE_LEN)?;
+    let mut cur = body.as_slice();
+    if read_u8(&mut cur)? != TYPE_REGISTER {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("expected register frame, got {:#04x}", tag[0]),
+            "expected register frame",
         ));
     }
     let mut bytes = [0u8; 4];
-    reader.read_exact(&mut bytes)?;
+    cur.read_exact(&mut bytes)?;
     Ok(Ipv4Addr::from(bytes))
 }
 
 /// Client-side authorization handshake: present an auth token to the server.
-pub fn write_auth(writer: &mut impl Write, token: &[u8]) -> io::Result<()> {
+pub fn write_auth(writer: &mut impl Write, crypto: &Crypto, token: &[u8]) -> io::Result<()> {
     if token.len() > MAX_AUTH_TOKEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("auth token too large: {}", token.len()),
         ));
     }
-    writer.write_all(&[TYPE_AUTH])?;
-    writer.write_all(&[token.len() as u8])?;
-    writer.write_all(token)?;
-    writer.flush()
+    let mut body = Vec::with_capacity(2 + token.len());
+    body.push(TYPE_AUTH);
+    body.push(token.len() as u8);
+    body.extend_from_slice(token);
+    write_frame(writer, crypto, &body)
 }
 
 /// Server-side authorization handshake: read the client's auth token.
-pub fn read_auth(reader: &mut impl Read) -> io::Result<Vec<u8>> {
-    let mut tag = [0u8; 1];
-    reader.read_exact(&mut tag)?;
-    if tag[0] != TYPE_AUTH {
+pub fn read_auth(reader: &mut impl Read, crypto: &Crypto) -> io::Result<Vec<u8>> {
+    let body = read_frame(reader, crypto, MAX_AUTH_TOKEN + 2 + NONCE_LEN)?;
+    let mut cur = body.as_slice();
+    if read_u8(&mut cur)? != TYPE_AUTH {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("expected auth frame, got {:#04x}", tag[0]),
+            "expected auth frame",
         ));
     }
-    let mut len_buf = [0u8; 1];
-    reader.read_exact(&mut len_buf)?;
-    let len = len_buf[0] as usize;
-    if len > MAX_AUTH_TOKEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("auth token too large: {len}"),
-        ));
-    }
+    let len = read_u8(&mut cur)? as usize;
     let mut token = vec![0u8; len];
-    reader.read_exact(&mut token)?;
+    cur.read_exact(&mut token)?;
     Ok(token)
 }
 
 /// Write the result of the authorization handshake.
-pub fn write_auth_result(writer: &mut impl Write, ok: bool) -> io::Result<()> {
-    writer.write_all(&[TYPE_AUTH_RESULT, if ok { AUTH_RESULT_OK } else { AUTH_RESULT_DENIED }])?;
-    writer.flush()
+pub fn write_auth_result(writer: &mut impl Write, crypto: &Crypto, ok: bool) -> io::Result<()> {
+    let body = [
+        TYPE_AUTH_RESULT,
+        if ok { AUTH_RESULT_OK } else { AUTH_RESULT_DENIED },
+    ];
+    write_frame(writer, crypto, &body)
 }
 
 /// Read the server's authorization result. Returns Ok(true) if accepted.
-pub fn read_auth_result(reader: &mut impl Read) -> io::Result<bool> {
-    let mut buf = [0u8; 2];
-    reader.read_exact(&mut buf)?;
-    if buf[0] != TYPE_AUTH_RESULT {
+pub fn read_auth_result(reader: &mut impl Read, crypto: &Crypto) -> io::Result<bool> {
+    let body = read_frame(reader, crypto, 2 + NONCE_LEN)?;
+    if body.first() != Some(&TYPE_AUTH_RESULT) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("expected auth result frame, got {:#04x}", buf[0]),
+            "expected auth result frame",
         ));
     }
-    Ok(buf[1] == AUTH_RESULT_OK)
+    Ok(body.get(1) == Some(&AUTH_RESULT_OK))
 }
 
 fn read_u8(reader: &mut impl Read) -> io::Result<u8> {

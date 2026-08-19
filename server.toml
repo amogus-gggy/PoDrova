@@ -14,3 +14,7 @@ allowed_tokens = ["change-me-token"]
 # Optional newline-separated allowlist file, merged with `allowed_tokens`.
 # Blank lines and `#` comments are ignored.
 allowed_tokens_file = ""
+
+[crypto]
+# Shared secret used to derive the encryption key. Must match the client.
+key = "change-me-crypto-key"

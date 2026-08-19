@@ -13,3 +13,7 @@ local_ip = "10.8.0.2"
 gateway = "10.8.0.1"
 netmask = "255.255.255.0"
 mtu = 1500
+
+[crypto]
+# Shared secret used to derive the encryption key. Must match the server.
+key = "change-me-crypto-key"

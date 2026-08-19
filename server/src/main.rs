@@ -27,6 +27,7 @@ fn main() -> io::Result<()> {
     let mtu = cfg.mtu;
 
     let allowed_tokens = cfg.allowed_tokens()?;
+    let crypto = build_crypto(&cfg)?;
     println!("authorization enabled ({} allowed token(s))", allowed_tokens.len());
 
     let dev = create_tun(gateway, netmask, mtu)?;
@@ -58,14 +59,24 @@ fn main() -> io::Result<()> {
 
         let router = Arc::clone(&router);
         let allowed_tokens = allowed_tokens.clone();
+        let crypto = crypto.clone();
         thread::spawn(move || {
-            if let Err(e) = handle_session(stream, router, &allowed_tokens) {
+            if let Err(e) = handle_session(stream, router, &allowed_tokens, &crypto) {
                 eprintln!("session error: {e}");
             }
         });
     }
 
     Ok(())
+}
+
+fn build_crypto(cfg: &config::ServerConfig) -> io::Result<protocol::Crypto> {
+    if cfg.crypto.key.is_empty() {
+        return Err(io::Error::other(
+            "crypto.key must be set and match the client's key",
+        ));
+    }
+    Ok(protocol::Crypto::from_shared(cfg.crypto.key.as_bytes()))
 }
 
 fn create_tun(gateway: Ipv4Addr, netmask: Ipv4Addr, mtu: u16) -> io::Result<Device> {
@@ -135,15 +146,16 @@ fn handle_session(
     stream: TcpStream,
     router: Arc<Router>,
     allowed_tokens: &std::collections::HashSet<Vec<u8>>,
+    crypto: &protocol::Crypto,
 ) -> io::Result<()> {
     let mut conn = stream;
     conn.set_nodelay(true)?;
 
     // Authorization: the client must present a token that is on the allowlist
     // (mirrors WireGuard's allowed-peers check, minus encryption).
-    let token = protocol::read_auth(&mut conn)?;
+    let token = protocol::read_auth(&mut conn, crypto)?;
     let authorized = allowed_tokens.contains(&token);
-    protocol::write_auth_result(&mut conn, authorized)?;
+    protocol::write_auth_result(&mut conn, crypto, authorized)?;
     if !authorized {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -151,7 +163,7 @@ fn handle_session(
         ));
     }
 
-    let client_ip = protocol::read_register(&mut conn)?;
+    let client_ip = protocol::read_register(&mut conn, crypto)?;
     let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
     {
         let mut clients = router.clients.lock().unwrap();
@@ -165,8 +177,10 @@ fn handle_session(
     let conn_writer = conn;
 
     let tun_writer = Arc::clone(&router.tun_writer);
-    let to_tun = thread::spawn(move || pump_client_to_tun(conn_reader, tun_writer));
-    let from_tun = thread::spawn(move || pump_tun_to_client(rx, conn_writer));
+    let crypto = crypto.clone();
+    let to_tun_crypto = crypto.clone();
+    let to_tun = thread::spawn(move || pump_client_to_tun(conn_reader, tun_writer, to_tun_crypto));
+    let from_tun = thread::spawn(move || pump_tun_to_client(rx, conn_writer, crypto));
 
     let to_tun_res = to_tun
         .join()
@@ -188,9 +202,13 @@ fn handle_session(
     Ok(())
 }
 
-fn pump_client_to_tun(mut conn: TcpStream, tun_writer: Arc<Mutex<Writer>>) -> io::Result<()> {
+fn pump_client_to_tun(
+    mut conn: TcpStream,
+    tun_writer: Arc<Mutex<Writer>>,
+    crypto: protocol::Crypto,
+) -> io::Result<()> {
     loop {
-        let packet = match protocol::read_packet(&mut conn) {
+        let packet = match protocol::read_packet(&mut conn, &crypto) {
             Ok(p) => p,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e),
@@ -203,9 +221,13 @@ fn pump_client_to_tun(mut conn: TcpStream, tun_writer: Arc<Mutex<Writer>>) -> io
     Ok(())
 }
 
-fn pump_tun_to_client(rx: Receiver<Vec<u8>>, mut conn: TcpStream) -> io::Result<()> {
+fn pump_tun_to_client(
+    rx: Receiver<Vec<u8>>,
+    mut conn: TcpStream,
+    crypto: protocol::Crypto,
+) -> io::Result<()> {
     while let Ok(packet) = rx.recv() {
-        protocol::write_packet(&mut conn, &packet)?;
+        protocol::write_packet(&mut conn, &crypto, &packet)?;
     }
     Ok(())
 }

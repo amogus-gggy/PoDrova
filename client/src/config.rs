@@ -11,6 +11,14 @@ pub struct ClientConfig {
     pub server: ServerConfig,
     pub auth: AuthConfig,
     pub tun: TunConfig,
+    pub crypto: CryptoConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CryptoConfig {
+    /// Shared secret used to derive the encryption key. Must match the server.
+    pub key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,7 +49,14 @@ impl Default for ClientConfig {
             server: ServerConfig::default(),
             auth: AuthConfig::default(),
             tun: TunConfig::default(),
+            crypto: CryptoConfig::default(),
         }
+    }
+}
+
+impl Default for CryptoConfig {
+    fn default() -> Self {
+        CryptoConfig { key: String::new() }
     }
 }
 
