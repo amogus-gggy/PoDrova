@@ -1,5 +1,5 @@
 use std::io::{self, Read, Write};
-use std::net::{Ipv4Addr, TcpStream};
+use std::net::TcpStream;
 use std::thread;
 
 use common::protocol;
