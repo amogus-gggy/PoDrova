@@ -5,29 +5,31 @@ use std::thread;
 use common::protocol;
 use tun::{Configuration, Device};
 
-#[derive(Debug, Clone)]
-pub struct ClientConfig {
-    pub server_addr: String,
-    pub server_port: u16,
-    pub local_ip: Ipv4Addr,
-    pub gateway: Ipv4Addr,
-    pub netmask: Ipv4Addr,
-    pub mtu: u16,
-}
+use crate::config::ClientConfig;
 
 pub fn run_client(config: ClientConfig) -> io::Result<()> {
     let dev = create_tun(&config)?;
     println!(
         "TUN device up: {} mask {} gateway {} mtu {}",
-        config.local_ip, config.netmask, config.gateway, config.mtu
+        config.tun.local_ip, config.tun.netmask, config.tun.gateway, config.tun.mtu
     );
 
-    let mut conn = TcpStream::connect((config.server_addr.as_str(), config.server_port))?;
+    let mut conn = TcpStream::connect((config.server.addr.as_str(), config.server.port))?;
     conn.set_nodelay(true)?;
-    protocol::write_register(&mut conn, config.local_ip)?;
+    protocol::write_auth(&mut conn, config.auth.token.as_bytes())?;
+    match protocol::read_auth_result(&mut conn)? {
+        true => {}
+        false => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "server rejected authorization token",
+            ));
+        }
+    }
+    protocol::write_register(&mut conn, config.tun.local_ip)?;
     println!(
         "connected to tunnel server {}:{} (pumping packets)",
-        config.server_addr, config.server_port
+        config.server.addr, config.server.port
     );
 
     let (tun_reader, tun_writer) = dev.split();
@@ -54,21 +56,21 @@ pub fn run_client(config: ClientConfig) -> io::Result<()> {
 
 fn create_tun(config: &ClientConfig) -> io::Result<Device> {
     let mut c = Configuration::default();
-    c.address(config.local_ip)
-        .netmask(config.netmask)
-        .mtu(config.mtu)
+    c.address(config.tun.local_ip)
+        .netmask(config.tun.netmask)
+        .mtu(config.tun.mtu)
         .up();
 
     #[cfg(target_os = "windows")]
     {
-        c.destination(config.gateway);
+        c.destination(config.tun.gateway);
         c.metric(1);
     }
 
     #[cfg(target_os = "linux")]
     {
         c.tun_name("tun0");
-        c.destination(config.gateway);
+        c.destination(config.tun.gateway);
     }
 
     let dev = tun::create(&c).map_err(|e| io::Error::other(e.to_string()))?;
@@ -83,7 +85,7 @@ fn create_tun(config: &ClientConfig) -> io::Result<Device> {
 fn configure_linux_routes(config: &ClientConfig, _dev: &Device) -> io::Result<()> {
     use std::process::Command;
     Command::new("ip")
-        .args(["route", "add", "default", "via", &config.gateway.to_string(), "dev", "tun0"])
+        .args(["route", "add", "default", "via", &config.tun.gateway.to_string(), "dev", "tun0"])
         .status()?;
     Ok(())
 }

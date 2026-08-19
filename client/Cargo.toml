@@ -6,3 +6,5 @@ edition = "2024"
 [dependencies]
 common = { path = "../common" }
 tun = "0.8.14"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

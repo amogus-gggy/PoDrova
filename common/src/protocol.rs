@@ -25,7 +25,16 @@ const FRAME_HEADER: usize = 5;
 // exchange raw IP packets as [u32 length BE][payload].
 pub const TYPE_REGISTER: u8 = 0x01;
 
+// Authorization handshake (modeled after WireGuard's peer allowlist, but
+// without encryption): the client presents a token and the server either
+// accepts or rejects the connection before any tunnel is registered.
+pub const TYPE_AUTH: u8 = 0x10;
+pub const TYPE_AUTH_RESULT: u8 = 0x11;
+pub const AUTH_RESULT_OK: u8 = 0x01;
+pub const AUTH_RESULT_DENIED: u8 = 0x00;
+
 pub const MAX_PACKET: usize = u16::MAX as usize;
+pub const MAX_AUTH_TOKEN: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Address {
@@ -269,6 +278,63 @@ pub fn read_register(reader: &mut impl Read) -> io::Result<Ipv4Addr> {
     let mut bytes = [0u8; 4];
     reader.read_exact(&mut bytes)?;
     Ok(Ipv4Addr::from(bytes))
+}
+
+/// Client-side authorization handshake: present an auth token to the server.
+pub fn write_auth(writer: &mut impl Write, token: &[u8]) -> io::Result<()> {
+    if token.len() > MAX_AUTH_TOKEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("auth token too large: {}", token.len()),
+        ));
+    }
+    writer.write_all(&[TYPE_AUTH])?;
+    writer.write_all(&[token.len() as u8])?;
+    writer.write_all(token)?;
+    writer.flush()
+}
+
+/// Server-side authorization handshake: read the client's auth token.
+pub fn read_auth(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut tag = [0u8; 1];
+    reader.read_exact(&mut tag)?;
+    if tag[0] != TYPE_AUTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected auth frame, got {:#04x}", tag[0]),
+        ));
+    }
+    let mut len_buf = [0u8; 1];
+    reader.read_exact(&mut len_buf)?;
+    let len = len_buf[0] as usize;
+    if len > MAX_AUTH_TOKEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("auth token too large: {len}"),
+        ));
+    }
+    let mut token = vec![0u8; len];
+    reader.read_exact(&mut token)?;
+    Ok(token)
+}
+
+/// Write the result of the authorization handshake.
+pub fn write_auth_result(writer: &mut impl Write, ok: bool) -> io::Result<()> {
+    writer.write_all(&[TYPE_AUTH_RESULT, if ok { AUTH_RESULT_OK } else { AUTH_RESULT_DENIED }])?;
+    writer.flush()
+}
+
+/// Read the server's authorization result. Returns Ok(true) if accepted.
+pub fn read_auth_result(reader: &mut impl Read) -> io::Result<bool> {
+    let mut buf = [0u8; 2];
+    reader.read_exact(&mut buf)?;
+    if buf[0] != TYPE_AUTH_RESULT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected auth result frame, got {:#04x}", buf[0]),
+        ));
+    }
+    Ok(buf[1] == AUTH_RESULT_OK)
 }
 
 fn read_u8(reader: &mut impl Read) -> io::Result<u8> {

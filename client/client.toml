@@ -1,0 +1,15 @@
+# PoDrova tunnel client configuration.
+
+[server]
+addr = "193.124.117.242"
+port = 7878
+
+[auth]
+# Must match one of the server's allowed tokens.
+token = "change-me-token"
+
+[tun]
+local_ip = "10.8.0.2"
+gateway = "10.8.0.1"
+netmask = "255.255.255.0"
+mtu = 1500

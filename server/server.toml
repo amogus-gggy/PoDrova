@@ -1,0 +1,16 @@
+# PoDrova tunnel server configuration.
+
+[server]
+listen_addr = "0.0.0.0:7878"
+gateway = "10.8.0.1"
+netmask = "255.255.255.0"
+mtu = 1500
+# Outbound interface used for NAT masquerading (Linux only).
+nat_iface = "eth0"
+
+[auth]
+# Tokens the server accepts. Clients must present one of these.
+allowed_tokens = ["change-me-token"]
+# Optional newline-separated allowlist file, merged with `allowed_tokens`.
+# Blank lines and `#` comments are ignored.
+allowed_tokens_file = ""

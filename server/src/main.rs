@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+mod config;
+
 use common::protocol;
 use tun::{Configuration, Device, Reader, Writer};
 
-const LISTEN_ADDR: &str = "0.0.0.0:7878";
-const DEFAULT_GATEWAY: &str = "10.8.0.1";
-const DEFAULT_NETMASK: &str = "255.255.255.0";
+const CONFIG_PATH: &str = "server.toml";
 
 /// Routes packets arriving on the server TUN interface back to the client
 /// that owns the destination virtual IP.
@@ -20,21 +21,19 @@ struct Router {
 }
 
 fn main() -> io::Result<()> {
-    let gateway: Ipv4Addr = std::env::var("TUN_GATEWAY")
-        .unwrap_or_else(|_| DEFAULT_GATEWAY.to_string())
-        .parse()
-        .map_err(|_| io::Error::other("TUN_GATEWAY must be a valid IPv4 address"))?;
-    let netmask: Ipv4Addr = std::env::var("TUN_NETMASK")
-        .unwrap_or_else(|_| DEFAULT_NETMASK.to_string())
-        .parse()
-        .map_err(|_| io::Error::other("TUN_NETMASK must be a valid IPv4 address"))?;
-    let mtu: u16 = std::env::var("TUN_MTU").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
+    let cfg = config::ServerConfig::load(Path::new(CONFIG_PATH))?;
+    let gateway = cfg.gateway;
+    let netmask = cfg.netmask;
+    let mtu = cfg.mtu;
+
+    let allowed_tokens = cfg.allowed_tokens()?;
+    println!("authorization enabled ({} allowed token(s))", allowed_tokens.len());
 
     let dev = create_tun(gateway, netmask, mtu)?;
     println!("TUN router up: {} mask {} mtu {}", gateway, netmask, mtu);
 
     #[cfg(target_os = "linux")]
-    enable_linux_forwarding()?;
+    enable_linux_forwarding(&cfg)?;
 
     let (tun_reader, tun_writer) = dev.split();
     let router = Arc::new(Router {
@@ -45,8 +44,8 @@ fn main() -> io::Result<()> {
     let tun_router = Arc::clone(&router);
     thread::spawn(move || run_tun_reader(tun_reader, tun_router));
 
-    let listener = TcpListener::bind(LISTEN_ADDR)?;
-    println!("tunnel server listening on {LISTEN_ADDR}");
+    let listener = TcpListener::bind(&cfg.listen_addr)?;
+    println!("tunnel server listening on {}", cfg.listen_addr);
 
     for incoming in listener.incoming() {
         let stream = match incoming {
@@ -58,8 +57,9 @@ fn main() -> io::Result<()> {
         };
 
         let router = Arc::clone(&router);
+        let allowed_tokens = allowed_tokens.clone();
         thread::spawn(move || {
-            if let Err(e) = handle_session(stream, router) {
+            if let Err(e) = handle_session(stream, router, &allowed_tokens) {
                 eprintln!("session error: {e}");
             }
         });
@@ -82,7 +82,7 @@ fn create_tun(gateway: Ipv4Addr, netmask: Ipv4Addr, mtu: u16) -> io::Result<Devi
 }
 
 #[cfg(target_os = "linux")]
-fn enable_linux_forwarding() -> io::Result<()> {
+fn enable_linux_forwarding(cfg: &config::ServerConfig) -> io::Result<()> {
     use std::process::Command;
 
     // Allow the kernel to route traffic between the tunnel and the internet.
@@ -93,20 +93,20 @@ fn enable_linux_forwarding() -> io::Result<()> {
     // Masquerade client virtual addresses behind the server's own address so
     // return traffic is routed back into the tunnel. Requires root/iptables and
     // the name of the server's outbound interface.
-    if let Ok(iface) = std::env::var("TUN_NAT_IFACE") {
+    if let Some(iface) = &cfg.nat_iface {
         let present = Command::new("iptables")
-            .args(["-t", "nat", "-C", "POSTROUTING", "-o", &iface, "-j", "MASQUERADE"])
+            .args(["-t", "nat", "-C", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
         if !present {
             Command::new("iptables")
-                .args(["-t", "nat", "-A", "POSTROUTING", "-o", &iface, "-j", "MASQUERADE"])
+                .args(["-t", "nat", "-A", "POSTROUTING", "-o", iface, "-j", "MASQUERADE"])
                 .status()?;
         }
     } else {
         eprintln!(
-            "TUN_NAT_IFACE not set; run iptables -t nat -A POSTROUTING -o <iface> -j MASQUERADE manually"
+            "nat_iface not set; run iptables -t nat -A POSTROUTING -o <iface> -j MASQUERADE manually"
         );
     }
 
@@ -129,9 +129,27 @@ fn run_tun_reader(mut tun_reader: Reader, router: Arc<Router>) {
     }
 }
 
-fn handle_session(stream: TcpStream, router: Arc<Router>) -> io::Result<()> {
+/// Reads the list of authorized client tokens.
+/// When the allowlist is empty every connection is rejected.
+fn handle_session(
+    stream: TcpStream,
+    router: Arc<Router>,
+    allowed_tokens: &std::collections::HashSet<Vec<u8>>,
+) -> io::Result<()> {
     let mut conn = stream;
     conn.set_nodelay(true)?;
+
+    // Authorization: the client must present a token that is on the allowlist
+    // (mirrors WireGuard's allowed-peers check, minus encryption).
+    let token = protocol::read_auth(&mut conn)?;
+    let authorized = allowed_tokens.contains(&token);
+    protocol::write_auth_result(&mut conn, authorized)?;
+    if !authorized {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "client token is not authorized",
+        ));
+    }
 
     let client_ip = protocol::read_register(&mut conn)?;
     let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
