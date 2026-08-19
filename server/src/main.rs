@@ -22,7 +22,7 @@ struct Router {
 
 fn main() -> io::Result<()> {
     let cfg = config::ServerConfig::load(Path::new(CONFIG_PATH))?;
-    println!("loaded config from {}: nat_iface={:?}", CONFIG_PATH, cfg.nat_iface);
+    println!("loaded config from {}: {:#?}", CONFIG_PATH, cfg);
     let gateway = cfg.gateway;
     let netmask = cfg.netmask;
     let mtu = cfg.mtu;
