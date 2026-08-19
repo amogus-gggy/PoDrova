@@ -111,9 +111,18 @@ fn configure_windows_routes(config: &ClientConfig, _dev: &Device) -> io::Result<
     }
 
     let server_addr = config.server.addr.as_str();
-    Command::new("route")
+    let out = Command::new("route")
         .args(["add", server_addr, "mask", "255.255.255.255", &gw, "metric", "1"])
-        .status()?;
+        .output()?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        let already_exists = msg.to_lowercase().contains("already exists");
+        if !already_exists {
+            return Err(io::Error::other(format!(
+                "failed to add route to {server_addr}: {msg}"
+            )));
+        }
+    }
 
     Ok(())
 }
