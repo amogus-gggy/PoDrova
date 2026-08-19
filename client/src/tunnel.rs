@@ -77,10 +77,45 @@ fn create_tun(config: &ClientConfig) -> io::Result<Device> {
 
     let dev = tun::create(&c).map_err(|e| io::Error::other(e.to_string()))?;
 
+    #[cfg(target_os = "windows")]
+    configure_windows_routes(config, &dev)?;
+
     #[cfg(target_os = "linux")]
     configure_linux_routes(config, &dev)?;
 
     Ok(dev)
+}
+
+/// The tunnel installs a default route that would swallow our own connection
+/// to the VPN server (a routing loop). Add a host route (/32) for the server
+/// via the physical NIC so the tunnel's control connection stays on the real
+/// network — the more specific prefix wins over the tunnel's default route.
+#[cfg(target_os = "windows")]
+fn configure_windows_routes(config: &ClientConfig, _dev: &Device) -> io::Result<()> {
+    use std::process::Command;
+
+    let tunnel_gw = config.tun.gateway.to_string();
+
+    // Find the physical default gateway (the one not pointing into the tunnel).
+    let ps = format!(
+        "Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Where-Object {{ $_.NextHop -ne '{tunnel_gw}' }} | Select-Object -First 1 -ExpandProperty NextHop"
+    );
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps])
+        .output()?;
+    let gw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if gw.is_empty() {
+        return Err(io::Error::other(
+            "could not determine physical default gateway",
+        ));
+    }
+
+    let server_addr = config.server.addr.as_str();
+    Command::new("route")
+        .args(["add", server_addr, "mask", "255.255.255.255", &gw, "metric", "1"])
+        .status()?;
+
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
