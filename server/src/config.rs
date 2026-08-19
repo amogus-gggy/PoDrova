@@ -71,7 +71,12 @@ impl ServerConfig {
             .map(|t| t.as_bytes().to_vec())
             .collect();
 
-        if let Some(path) = &self.auth.allowed_tokens_file {
+        if let Some(path) = self
+            .auth
+            .allowed_tokens_file
+            .as_deref()
+            .filter(|p| !p.is_empty())
+        {
             let content = fs::read_to_string(path)?;
             for line in content.lines() {
                 let line = line.trim();
