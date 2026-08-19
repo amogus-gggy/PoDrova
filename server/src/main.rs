@@ -153,7 +153,13 @@ fn handle_session(
 
     // Authorization: the client must present a token that is on the allowlist
     // (mirrors WireGuard's allowed-peers check, minus encryption).
-    let token = protocol::read_auth(&mut conn, crypto)?;
+    let token = match protocol::read_auth(&mut conn, crypto) {
+        Ok(t) => t,
+        // Client gave up before finishing the handshake (e.g. killed or
+        // wrong crypto key). This is a normal teardown, not an error.
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(e) => return Err(e),
+    };
     let authorized = allowed_tokens.contains(&token);
     protocol::write_auth_result(&mut conn, crypto, authorized)?;
     if !authorized {
@@ -163,7 +169,11 @@ fn handle_session(
         ));
     }
 
-    let client_ip = protocol::read_register(&mut conn, crypto)?;
+    let client_ip = match protocol::read_register(&mut conn, crypto) {
+        Ok(ip) => ip,
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(e) => return Err(e),
+    };
     let (tx, rx): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = mpsc::channel();
     {
         let mut clients = router.clients.lock().unwrap();
@@ -182,18 +192,24 @@ fn handle_session(
     let to_tun = thread::spawn(move || pump_client_to_tun(conn_reader, tun_writer, to_tun_crypto));
     let from_tun = thread::spawn(move || pump_tun_to_client(rx, conn_writer, crypto));
 
+    // Wait for the client->TUN pump first. It finishes when the client closes
+    // its side of the TCP connection (EOF).
     let to_tun_res = to_tun
         .join()
         .unwrap_or_else(|_| Err(io::Error::other("client->tun pump panicked")));
-    let from_tun_res = from_tun
-        .join()
-        .unwrap_or_else(|_| Err(io::Error::other("tun->client pump panicked")));
 
-    // Deregister so the TUN reader stops routing to this (now closed) client.
+    // Deregister before joining the other pump: dropping the sender is what
+    // unblocks pump_tun_to_client's recv(). Doing this after both joins would
+    // deadlock forever, because the sender is still registered in the map.
     {
         let mut clients = router.clients.lock().unwrap();
         clients.remove(&client_ip);
     }
+
+    let from_tun_res = from_tun
+        .join()
+        .unwrap_or_else(|_| Err(io::Error::other("tun->client pump panicked")));
+
     println!("tunnel closed for {client_ip}");
 
     if to_tun_res.is_err() || from_tun_res.is_err() {
