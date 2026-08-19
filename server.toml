@@ -1,6 +1,5 @@
 # PoDrova tunnel server configuration.
 
-[server]
 listen_addr = "0.0.0.0:7878"
 gateway = "10.8.0.1"
 netmask = "255.255.255.0"
